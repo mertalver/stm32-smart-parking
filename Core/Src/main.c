@@ -1,39 +1,45 @@
-/* USER CODE BEGIN Header */
-/**
-  ******************************************************************************
-  * @file           : main.c
-  * @brief          : Main program body
-  ******************************************************************************
-  * @attention
-  *
-  * Copyright (c) 2025 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
-  ******************************************************************************
-  */
-/* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "cmsis_os.h"
 #include "usb_device.h"
-#include <stdlib.h>
-#include <stdio.h>
 #include <string.h>
+#include <stdio.h>
 #include "ssd1306.h"
 #include "ssd1306_fonts.h"
+#include "usbd_cdc_if.h"
+#include "queue.h"
+#include "semphr.h"
 
-uint8_t gelen_buf[64];
-int32_t dogru_cevap;
-char dogru_cevap_buffer[64];
-char soru[64];
-volatile uint8_t timer_done = 0; // Timer tamamlanma bayrağı
-volatile uint8_t countdown = 20;
-
+SemaphoreHandle_t oledMutex;
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#define TOTAL_SPOTS 15
+
+typedef struct {
+  char id[4];        // A1, B2 vs.
+  uint8_t status;    // 0 boş, 1 rezerve
+  uint16_t timeLeft; // dakika
+  float price;       // fiyat (TL)
+} ParkingSpot;
+
+ParkingSpot spots[TOTAL_SPOTS];
+
+typedef struct {
+    char line1[22]; // OLED satır 1 (en fazla 21 karakter)
+    char line2[22]; // OLED satır 2
+    uint16_t duration_ms; // mesajı kaç ms boyunca gösterelim
+} OledMessage;
+
+QueueHandle_t oledQueue;
+QueueHandle_t commandQueue;
+
+// İstatistik değişkenleri
+uint32_t totalReservations = 0;
+uint32_t totalMinutesParked = 0;
+uint32_t completedReservations = 0;
+uint8_t occupiedSpots = 0;
+
+char rxBuffer[64];
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -43,6 +49,9 @@ volatile uint8_t countdown = 20;
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+// Gösterilecek sayı (örneğin boş yer sayısı)
+uint8_t displayValue = 0;
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -51,7 +60,6 @@ volatile uint8_t countdown = 20;
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
-ADC_HandleTypeDef hadc1;
 I2C_HandleTypeDef hi2c1;
 
 I2S_HandleTypeDef hi2s2;
@@ -59,10 +67,27 @@ I2S_HandleTypeDef hi2s3;
 
 SPI_HandleTypeDef hspi1;
 
-TIM_HandleTypeDef htim2;
-
-UART_HandleTypeDef huart1;
-
+/* Definitions for UsbCommTask */
+osThreadId_t UsbCommTaskHandle;
+const osThreadAttr_t UsbCommTask_attributes = {
+  .name = "UsbCommTask",
+  .stack_size = 1024 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+/* Definitions for ParkingManagerT */
+osThreadId_t ParkingManagerTHandle;
+const osThreadAttr_t ParkingManagerT_attributes = {
+  .name = "ParkingManagerT",
+  .stack_size = 1024 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+/* Definitions for DisplayTask */
+osThreadId_t DisplayTaskHandle;
+const osThreadAttr_t DisplayTask_attributes = {
+  .name = "DisplayTask",
+  .stack_size = 1024 * 4,
+  .priority = (osPriority_t) osPriorityAboveNormal,
+};
 /* USER CODE BEGIN PV */
 
 /* USER CODE END PV */
@@ -75,365 +100,145 @@ static void MX_I2C1_Init(void);
 static void MX_I2S2_Init(void);
 static void MX_I2S3_Init(void);
 static void MX_SPI1_Init(void);
-static void MX_TIM2_Init(void);
-static void MX_ADC1_Init(void);
-static void MX_USART1_UART_Init(void);
+void StartUsbCommTask(void *argument);
+void StartParkingManagerTask(void *argument);
+void StartDisplayTask(void *argument);
 
 /* USER CODE BEGIN PFP */
+
+extern uint8_t segmentCodes[10];
+extern GPIO_TypeDef* segmentPorts[7];
+extern uint16_t segmentPins[7];
+extern GPIO_TypeDef* digitPorts[4];
+extern uint16_t digitPins[4];
+
+void segment_init(void);
+void setSegment(uint8_t index, GPIO_PinState state);
+void setDigit(uint8_t index, GPIO_PinState state);
+void update7Segment(uint8_t val);
+void segment_refresh_loop(uint8_t val);
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-
+void initParkingSpots() {
+  int index = 0;
+  for (char block = 'A'; block <= 'C'; block++) {
+    for (int num = 1; num <= 5; num++) {
+      sprintf(spots[index].id, "%c%d", block, num);
+      spots[index].status = 0;
+      spots[index].timeLeft = 0;
+      spots[index].price = 0.0;
+      index++;
+    }
+  }
+}
 /* USER CODE END 0 */
-
 
 /**
   * @brief  The application entry point.
   * @retval int
   */
-/* Kullanıcı performansını tutan Struct */
-typedef struct {
-    int dogru_sayisi;
-    int yanlis_sayisi;
-    int zaman_yetmedi;
-} KullaniciPerformansi;
+int main(void)
+{
 
-static KullaniciPerformansi performans = {0, 0, 0};
+  /* USER CODE END 1 */
 
-/* Zorluk Seviyesi Enum */
-typedef enum {
-    ZORLUK_KOLAY = 0,
-    ZORLUK_ORTA,
-    ZORLUK_ZOR
-} ZorlukSeviyesi;
+  /* MCU Configuration--------------------------------------------------------*/
 
-/* --- Prototipler --- */
-uint32_t SimpleHash(uint32_t input);
-void     InitializeRandomSeed(void);
-void     CheckUserAnswer(uint8_t *data);
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+  /* USER CODE END Init */
 
-uint32_t ReadPotentiometer(void);
-ZorlukSeviyesi GetDifficultyLevel(void);
+  /* Configure the system clock */
+  SystemClock_Config();
 
-void     SetCountdownByDifficulty(ZorlukSeviyesi zorluk);
-void     GenerateRandomQuestion(ZorlukSeviyesi zorluk);
-const char* GetDifficultyString(ZorlukSeviyesi zorluk);
+  /* Configure the peripherals common clocks */
+  PeriphCommonClock_Config();
 
-/* --- Fonksiyonlar --- */
+  /* USER CODE BEGIN SysInit */
 
-/**
-  * @brief  Basit bir hashing fonksiyonu ile seed değerini karıştırır.
-  * @param  input: Girdi değer
-  * @retval Karma değer
-  */
-uint32_t GenerateAnalogRandomSeed(void) {
-    uint32_t adcValue = 0;
+  /* USER CODE END SysInit */
 
-    // ADC'yi başlat
-    HAL_ADC_Start(&hadc1);
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_I2C1_Init();
+  MX_I2S2_Init();
+  MX_I2S3_Init();
+  MX_SPI1_Init();
+  /* USER CODE BEGIN 2 */
+  /* USER CODE END 2 */
 
-    // ADC ölçümünü bekle
-    if (HAL_ADC_PollForConversion(&hadc1, HAL_MAX_DELAY) == HAL_OK) {
-        adcValue = HAL_ADC_GetValue(&hadc1);  // ADC ölçüm sonucu
-    }
+  /* Init scheduler */
+  osKernelInitialize();
 
-    // ADC'yi durdur
-    HAL_ADC_Stop(&hadc1);
+  /* USER CODE BEGIN RTOS_MUTEX */
+  /* add mutexes, ... */
+  oledMutex = xSemaphoreCreateMutex();
+  if (oledMutex == NULL) {
+      Error_Handler();
+  }
 
-    return adcValue;  // Rastgelelik kaynağı olarak ADC değeri
-}
+  commandQueue = xQueueCreate(20, sizeof(char[64]));
+  if (commandQueue == NULL) {
+	  Error_Handler();
+  }
 
-void InitializeRandomSeed(void) {
-    uint32_t seed = GenerateAnalogRandomSeed();  // ADC'den rastgelelik
-    seed ^= HAL_GetTick();  // Seed'i zamanla karıştır
-    srand(seed);  // Rastgele sayı üreteci başlat
-}
+  oledQueue = xQueueCreate(20, sizeof(OledMessage));
+  if (oledQueue == NULL) {
+      Error_Handler();
+  }
+  /* USER CODE END RTOS_MUTEX */
 
-/**
-  * @brief  Rastgele dört işlem sorusu üretir ve global soru değişkenine yazdırır.
-  */
-void GenerateRandomQuestion(ZorlukSeviyesi zorluk) {
-    int sayi1, sayi2;
-    char islem;
+  /* USER CODE BEGIN RTOS_SEMAPHORES */
+  /* add semaphores, ... */
+  /* USER CODE END RTOS_SEMAPHORES */
 
-    switch (zorluk) {
-        case ZORLUK_KOLAY:
-            sayi1 = rand() % 50 + 1;   // 1–50 arası
-            sayi2 = rand() % 50 + 1;   // 1–50 arası
-            islem = (rand() % 2 == 0) ? '+' : '-'; // Toplama veya çıkarma
-            break;
+  /* USER CODE BEGIN RTOS_TIMERS */
+  /* start timers, add new ones, ... */
+  /* USER CODE END RTOS_TIMERS */
 
-        case ZORLUK_ORTA:
-            sayi1 = rand() % 100 + 1;  // 1–100 arası
-            sayi2 = rand() % 100 + 1;  // 1–100 arası
-            switch (rand() % 3) {      // Toplama, çıkarma, çarpma
-                case 0: islem = '+'; break;
-                case 1: islem = '-'; break;
-                case 2: islem = '*'; break;
-            }
-            break;
+  /* USER CODE BEGIN RTOS_QUEUES */
 
-        case ZORLUK_ZOR:
-            sayi1 = rand() % 100 + 1;  // 1–100 arası
-            sayi2 = rand() % 100 + 1;  // 1–100 arası
-            switch (rand() % 4) {      // Toplama, çıkarma, çarpma, bölme
-                case 0: islem = '+'; break;
-                case 1: islem = '-'; break;
-                case 2: islem = '*'; break;
-                case 3:
-                    islem = '/';
-                    if (sayi2 == 0) sayi2 = 1; // Sıfıra bölünmeyi önle
-                    break;
-            }
-            break;
-    }
+  initParkingSpots();
+  /* USER CODE END RTOS_QUEUES */
 
-    // Doğru cevabı hesapla
-    switch (islem) {
-        case '+': dogru_cevap = sayi1 + sayi2; break;
-        case '-': dogru_cevap = sayi1 - sayi2; break;
-        case '*': dogru_cevap = sayi1 * sayi2; break;
-        case '/': dogru_cevap = sayi1 / sayi2; break;
-    }
+  /* Create the thread(s) */
+  /* creation of UsbCommTask */
+  UsbCommTaskHandle = osThreadNew(StartUsbCommTask, NULL, &UsbCommTask_attributes);
 
-    // Soruyu oluştur
-    sprintf(soru, "Sorunuz: %d %c %d = ?\n", sayi1, islem, sayi2);
-}
+  /* creation of ParkingManagerT */
+  ParkingManagerTHandle = osThreadNew(StartParkingManagerTask, NULL, &ParkingManagerT_attributes);
 
-/**
-  * @brief  Kullanıcının verdiği cevabı kontrol eder ve performans verisini günceller.
-  * @param  data: Kullanıcıdan gelen cevap (string olarak)
-  */
-void CheckUserAnswer(uint8_t *data) {
-    int kullanici_cevap = atoi((char *)data); // Kullanıcı cevabını int'e çevir
+  /* creation of DisplayTask */
+  DisplayTaskHandle = osThreadNew(StartDisplayTask, NULL, &DisplayTask_attributes);
 
-    if (kullanici_cevap == dogru_cevap) {
-        performans.dogru_sayisi++;
-        HAL_GPIO_WritePin(GPIOD, GPIO_PIN_12, GPIO_PIN_SET); // Yeşil LED yak
-        ssd1306_SetCursor(0, 12);
-        ssd1306_WriteString("DOGRU", Font_7x10, White);
-        ssd1306_UpdateScreen();
-        HAL_Delay(2000);
-        HAL_GPIO_WritePin(GPIOD, GPIO_PIN_12, GPIO_PIN_RESET);
-    } else {
-        performans.yanlis_sayisi++;
-        HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_SET); // Kırmızı LED yak
+  /* USER CODE BEGIN RTOS_THREADS */
+  /* USER CODE END RTOS_THREADS */
 
-        ssd1306_SetCursor(0, 0);
-        ssd1306_WriteString("YANLIS", Font_7x10, White);
+  /* USER CODE BEGIN RTOS_EVENTS */
+  /* add events, ... */
+  /* USER CODE END RTOS_EVENTS */
 
-        ssd1306_SetCursor(0, 12);
-        sprintf(dogru_cevap_buffer, "Dogru Cevap: %d", dogru_cevap);
-        ssd1306_WriteString(dogru_cevap_buffer, Font_6x8, White);
+  OledMessage testMsg = { "Test", "Calisiyor", 3000 };
+  xQueueSend(oledQueue, &testMsg, 0);
 
-        ssd1306_UpdateScreen();
-        HAL_Delay(2000);
-        HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_RESET);
-    }
-}
+  /* Start scheduler */
+  osKernelStart();
+  HAL_GPIO_WritePin(GPIOD, LD5_Pin, GPIO_PIN_SET); // KIRMIZI LED
 
-/**
-  * @brief  Potansiyometre değerini ADC üzerinden okur ve değeri döndürür.
-  * @retval ADC değeri
-  */
-uint32_t ReadPotentiometer(void) {
-    uint32_t adcValue = 0;
+  /* We should never get here as control is now taken by the scheduler */
 
-    // ADC'yi başlat
-    HAL_ADC_Start(&hadc1);
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
 
-    // Ölçüm tamamlanana kadar bekle
-    if (HAL_ADC_PollForConversion(&hadc1, HAL_MAX_DELAY) == HAL_OK) {
-        // Okunan değeri al
-        adcValue = HAL_ADC_GetValue(&hadc1);
-    }
-
-    // ADC'yi durdur
-    HAL_ADC_Stop(&hadc1);
-
-    return adcValue;
-}
-
-/**
-  * @brief  Potansiyometreden okunan değere göre zorluk seviyesini belirler.
-  *         0-1365   : KOLAY
-  *         1365-2730: ORTA
-  *         2730-4095: ZOR
-  * @retval ZorlukSeviyesi enum değeri
-  */
-ZorlukSeviyesi GetDifficultyLevel(void) {
-    uint32_t adcValue = ReadPotentiometer();
-
-    if (adcValue < 1365) {
-        return ZORLUK_KOLAY;
-    } else if (adcValue < 2730) {
-        return ZORLUK_ORTA;
-    } else {
-        return ZORLUK_ZOR;
-    }
-}
-
-/**
-  * @brief  Verilen zorluk seviyesine göre geri sayım süresini ayarlar.
-  * @param  zorluk: ZorlukSeviyesi
-  */
-void SetCountdownByDifficulty(ZorlukSeviyesi zorluk) {
-    switch (zorluk) {
-        case ZORLUK_KOLAY:
-            countdown = 30;
-            break;
-        case ZORLUK_ORTA:
-            countdown = 20;
-            break;
-        case ZORLUK_ZOR:
-            countdown = 10;
-            break;
-        default:
-            countdown = 20; // Varsayılan
-            break;
-    }
-}
-
-/**
-  * @brief  Zorluk enum değerini string olarak döndürür.
-  * @param  zorluk: ZorlukSeviyesi
-  * @retval Zorluk seviyesini temsil eden string
-  */
-const char* GetDifficultyString(ZorlukSeviyesi zorluk) {
-    switch (zorluk) {
-        case ZORLUK_KOLAY:
-            return "KOLAY";
-        case ZORLUK_ORTA:
-            return "ORTA";
-        case ZORLUK_ZOR:
-            return "ZOR";
-        default:
-            return "BILINMIYOR";
-    }
-}
-
-/**
-  * @brief  Timer kesmesi. Her kesmede geri sayım yapılır.
-  * @param  htim: Timer handle
-  */
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
-    if (htim == &htim2) {
-        if (countdown > 0) {
-            countdown--;
-        } else {
-            timer_done = 1;
-        }
-    }
-}
-
-/* --- main--- */
-int main(void) {
-    HAL_Init();
-    SystemClock_Config();
-    MX_GPIO_Init();
-    MX_USB_DEVICE_Init();
-    MX_USART1_UART_Init();
-    MX_I2C1_Init();
-    MX_TIM2_Init();
-    MX_ADC1_Init();
-
-    /* Timer'ı başlat (interrupt) */
-    HAL_TIM_Base_Start_IT(&htim2);
-
-    /* Rastgele sayı üretimi için seed oluştur */
-    InitializeRandomSeed();
-
-    char countdown_message[20];
-    ssd1306_Init();
-
-    /* Uygulama ilk açıldığında zorluk seviyesini göster */
-    ZorlukSeviyesi zorluk = GetDifficultyLevel();
-    SetCountdownByDifficulty(zorluk);
-
-    const char* zorluk_seviyesi_str = GetDifficultyString(zorluk);
-    ssd1306_SetCursor(0, 12);
-    ssd1306_WriteString("Zorluk: ", Font_7x10, White);
-    ssd1306_WriteString(zorluk_seviyesi_str, Font_7x10, White);
-    ssd1306_UpdateScreen();
-
-    while (1) {
-        /* Yeni Soru komutu geldiğinde */
-        if (strcmp(gelen_buf, "Yeni Soru") == 0) {
-            ssd1306_Init();
-
-            /* Her yeni soruda zorluk tekrar okunup countdown yeniden ayarlanabilir */
-            ZorlukSeviyesi zorluk = GetDifficultyLevel();
-            SetCountdownByDifficulty(zorluk);
-
-            /* Soru üret ve gönder */
-            GenerateRandomQuestion(zorluk);
-            CDC_Transmit_FS((uint8_t *)soru, strlen(soru));
-
-            /* Kalan süre mesajı */
-            sprintf(countdown_message, "Kalan sure: %lu\n", (unsigned long)countdown);
-            CDC_Transmit_FS((uint8_t *)countdown_message, strlen(countdown_message));
-
-            /* Gelen buffer temizle */
-            memset(gelen_buf, 0, sizeof(gelen_buf));
-
-            timer_done = 0;
-            uint32_t old_countdown = (uint32_t)(-1);
-
-            /* Timer bitene veya cevap gelene kadar bekle */
-            while (!timer_done) {
-                if (gelen_buf[0] != '\0') {
-                    /* Kullanıcı cevabı gelmiş, kontrol et */
-                    CheckUserAnswer((uint8_t*)gelen_buf);
-                    break;
-                }
-                /* Her 1 saniyede bir countdown değiştiğinde süreyi gönder */
-                if (old_countdown != countdown) {
-                    old_countdown = countdown;
-                    sprintf(countdown_message, "Kalan sure: %lu\n", (unsigned long)countdown);
-                    CDC_Transmit_FS((uint8_t *)countdown_message, strlen(countdown_message));
-                }
-            }
-
-            /* Süre dolmuş ama cevap gelmemiş ise */
-            if (timer_done && gelen_buf[0] == '\0') {
-                performans.zaman_yetmedi++;
-                HAL_GPIO_WritePin(GPIOD, GPIO_PIN_13, GPIO_PIN_SET);
-
-                ssd1306_SetCursor(0, 0);
-                ssd1306_WriteString("SURENIZ BITTI", Font_7x10, White);
-
-                ssd1306_SetCursor(0, 12);
-                sprintf(dogru_cevap_buffer, "Dogru Cevap: %d", dogru_cevap);
-                ssd1306_WriteString(dogru_cevap_buffer, Font_6x8, White);
-
-                ssd1306_UpdateScreen();
-                HAL_Delay(2000);
-                HAL_GPIO_WritePin(GPIOD, GPIO_PIN_13, GPIO_PIN_RESET);
-            }
-        }
-
-        /* Sonucu Gör komutu geldiğinde */
-        if (strcmp(gelen_buf, "Sonucu Gor") == 0) {
-            memset(gelen_buf, 0, sizeof(gelen_buf));
-            ssd1306_Init();
-
-            char buffer[30];
-            ssd1306_SetCursor(0, 0);
-            ssd1306_WriteString("Sonuclar:", Font_6x8, White);
-
-            ssd1306_SetCursor(0, 12);
-            sprintf(buffer, "Dogru: %d Yanlis: %d", performans.dogru_sayisi, performans.yanlis_sayisi);
-            ssd1306_WriteString(buffer, Font_6x8, White);
-
-            ssd1306_SetCursor(0, 24);
-            sprintf(buffer, "Zaman Yetmedi: %d", performans.zaman_yetmedi);
-            ssd1306_WriteString(buffer, Font_6x8, White);
-
-            ssd1306_UpdateScreen();
-        }
-    }
+    /* USER CODE BEGIN 3 */
+  }
+  /* USER CODE END 3 */
 }
 
 /**
@@ -506,53 +311,6 @@ void PeriphCommonClock_Config(void)
   * @param None
   * @retval None
   */
-static void MX_ADC1_Init(void)
-{
-
-  /* USER CODE BEGIN ADC1_Init 0 */
-
-  /* USER CODE END ADC1_Init 0 */
-
-  ADC_ChannelConfTypeDef sConfig = {0};
-
-  /* USER CODE BEGIN ADC1_Init 1 */
-
-  /* USER CODE END ADC1_Init 1 */
-
-  /** Configure the global features of the ADC (Clock, Resolution, Data Alignment and number of conversion)
-  */
-  hadc1.Instance = ADC1;
-  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
-  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
-  hadc1.Init.ScanConvMode = DISABLE;
-  hadc1.Init.ContinuousConvMode = DISABLE;
-  hadc1.Init.DiscontinuousConvMode = DISABLE;
-  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
-  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
-  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
-  hadc1.Init.NbrOfConversion = 1;
-  hadc1.Init.DMAContinuousRequests = DISABLE;
-  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
-  if (HAL_ADC_Init(&hadc1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
-  */
-  sConfig.Channel = ADC_CHANNEL_1;
-  sConfig.Rank = 1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_3CYCLES;
-  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN ADC1_Init 2 */
-
-  /* USER CODE END ADC1_Init 2 */
-
-}
-
 static void MX_I2C1_Init(void)
 {
 
@@ -689,84 +447,6 @@ static void MX_SPI1_Init(void)
 }
 
 /**
-  * @brief TIM2 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM2_Init(void)
-{
-
-  /* USER CODE BEGIN TIM2_Init 0 */
-
-  /* USER CODE END TIM2_Init 0 */
-
-  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-
-  /* USER CODE BEGIN TIM2_Init 1 */
-
-  /* USER CODE END TIM2_Init 1 */
-  htim2.Instance = TIM2;
-  htim2.Init.Prescaler = 4800-1;
-  htim2.Init.CounterMode = TIM_COUNTERMODE_DOWN;
-  htim2.Init.Period = 10000-1;
-  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
-  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_UPDATE;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM2_Init 2 */
-
-  /* USER CODE END TIM2_Init 2 */
-
-}
-
-/**
-  * @brief USART1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_USART1_UART_Init(void)
-{
-
-  /* USER CODE BEGIN USART1_Init 0 */
-
-  /* USER CODE END USART1_Init 0 */
-
-  /* USER CODE BEGIN USART1_Init 1 */
-
-  /* USER CODE END USART1_Init 1 */
-  huart1.Instance = USART1;
-  huart1.Init.BaudRate = 115200;
-  huart1.Init.WordLength = UART_WORDLENGTH_8B;
-  huart1.Init.StopBits = UART_STOPBITS_1;
-  huart1.Init.Parity = UART_PARITY_NONE;
-  huart1.Init.Mode = UART_MODE_TX_RX;
-  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
-  if (HAL_UART_Init(&huart1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN USART1_Init 2 */
-
-  /* USER CODE END USART1_Init 2 */
-
-}
-
-/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -850,6 +530,298 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE END 4 */
 
+/* USER CODE BEGIN Header_StartUsbCommTask */
+/**
+  * @brief  Function implementing the UsbCommTask thread.
+  * @param  argument: Not used
+  * @retval None
+  */
+/* USER CODE END Header_StartUsbCommTask */
+uint8_t commandReady = 0;
+
+void StartUsbCommTask(void *argument) {
+  MX_USB_DEVICE_Init();
+  while (1) {
+	  if (commandReady) {
+	      commandReady = 0;
+
+	      OledMessage msg;
+	      snprintf(msg.line1, sizeof(msg.line1), "USB OK");
+	      snprintf(msg.line2, sizeof(msg.line2), "Komut Alindi");
+	      msg.duration_ms = 2000;
+	      xQueueSend(oledQueue, &msg, 0);
+
+	      char temp[64];
+	      strcpy(temp, rxBuffer);
+
+	      // Queue'ya gönder
+	      xQueueSend(commandQueue, &temp, pdMS_TO_TICKS(100));
+	  }
+    osDelay(10);
+  }
+}
+
+/* USER CODE BEGIN Header_StartParkingManagerTask */
+/**
+* @brief Function implementing the ParkingManagerT thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartParkingManagerTask */
+void StartParkingManagerTask(void *argument) {
+    char cmd[64];
+    TickType_t lastCheck = xTaskGetTickCount();
+    TickType_t lastStatsUpdate = xTaskGetTickCount();
+    uint8_t reminderSent[TOTAL_SPOTS] = {0};
+
+    while (1) {
+        // Queue'dan komut bekle
+        if (xQueueReceive(commandQueue, &cmd, pdMS_TO_TICKS(100)) == pdPASS) {
+
+            if (strncmp(cmd, "RESERVE", 7) == 0) {
+                char spot[4] = {0};
+                int duration = 0;
+                float price = 0.0;
+
+                int parsed = sscanf(cmd, "RESERVE;%3[^;];%d;%f", spot, &duration, &price);
+                if (parsed >= 2) {  // En az spot ve duration bilgisi varsa
+                    spot[strcspn(spot, "\r\n")] = 0;
+                    spot[3] = '\0';
+
+                    for (int i = 0; i < TOTAL_SPOTS; i++) {
+                        if (strcmp(spots[i].id, spot) == 0) {
+                            spots[i].status = 1;
+                            spots[i].timeLeft = duration;
+                            
+                            // Fiyat bilgisi varsa kaydet
+                            if (parsed == 3) {
+                                spots[i].price = price;
+                            }
+                            
+                            // İstatistikleri güncelle
+                            totalReservations++;
+                            occupiedSpots++;
+
+                            OledMessage reserveMsg;
+                            snprintf(reserveMsg.line1, sizeof(reserveMsg.line1), "Rezerve: %s", spots[i].id);
+                            
+                            if (parsed == 3) {
+                                snprintf(reserveMsg.line2, sizeof(reserveMsg.line2), "%d dk, %.1f TL", duration, price);
+                            } else {
+                                snprintf(reserveMsg.line2, sizeof(reserveMsg.line2), "Sure: %d dk", duration);
+                            }
+                            
+                            reserveMsg.duration_ms = 3000;
+                            xQueueSend(oledQueue, &reserveMsg, pdMS_TO_TICKS(100));
+                            
+                            reminderSent[i] = 0; // Hatırlatma sıfırla
+                            break;
+                        }
+                    }
+                }
+                else {
+                    OledMessage err;
+                    snprintf(err.line1, sizeof(err.line1), "Komut hatali");
+                    snprintf(err.line2, sizeof(err.line2), "%.20s", cmd);
+                    err.duration_ms = 3000;
+                    xQueueSend(oledQueue, &err, pdMS_TO_TICKS(100));
+                }
+            }
+            else if (strncmp(cmd, "CANCEL", 6) == 0) {
+                char spot[4] = {0};
+                sscanf(cmd, "CANCEL;%3s", spot);
+                spot[strcspn(spot, "\r\n")] = 0;
+
+                for (int i = 0; i < TOTAL_SPOTS; i++) {
+                    if (strcmp(spots[i].id, spot) == 0 && spots[i].status == 1) {
+                        uint16_t kalanSure = spots[i].timeLeft;
+                        float spotPrice = spots[i].price;
+
+                        // İstatistikleri güncelle
+                        occupiedSpots--;
+                        totalMinutesParked += (duration - kalanSure);
+                        completedReservations++;
+
+                        spots[i].status = 0;
+                        spots[i].timeLeft = 0;
+                        spots[i].price = 0.0;
+
+                        OledMessage cancelMsg;
+                        snprintf(cancelMsg.line1, sizeof(cancelMsg.line1), "Iptal: %s", spots[i].id);
+                        snprintf(cancelMsg.line2, sizeof(cancelMsg.line2), "Kalan: %d dk", kalanSure);
+                        cancelMsg.duration_ms = 3000;
+                        xQueueSend(oledQueue, &cancelMsg, pdMS_TO_TICKS(100));
+
+                        char usbMsg[64];
+                        snprintf(usbMsg, sizeof(usbMsg), "EXPIRED;%s\r\n", spots[i].id);
+                        CDC_Transmit_FS((uint8_t*)usbMsg, strlen(usbMsg));
+                        break;
+                    }
+                }
+            }
+            else if (strncmp(cmd, "GET_STATS", 9) == 0) {
+                // İstatistikleri gönder
+                char statsMsg[128];
+                float avgDuration = 0;
+                
+                if (completedReservations > 0) {
+                    avgDuration = (float)totalMinutesParked / completedReservations;
+                }
+                
+                snprintf(statsMsg, sizeof(statsMsg), 
+                         "STATS;TOTAL_RESERVATIONS:%lu;COMPLETED:%lu;AVG_DURATION:%.1f;OCCUPIED:%d\r\n", 
+                         totalReservations, completedReservations, avgDuration, occupiedSpots);
+                         
+                CDC_Transmit_FS((uint8_t*)statsMsg, strlen(statsMsg));
+                
+                // OLED'e de göster
+                OledMessage statsOledMsg;
+                snprintf(statsOledMsg.line1, sizeof(statsOledMsg.line1), "Stats sent");
+                snprintf(statsOledMsg.line2, sizeof(statsOledMsg.line2), "Total Res: %lu", totalReservations);
+                statsOledMsg.duration_ms = 2000;
+                xQueueSend(oledQueue, &statsOledMsg, pdMS_TO_TICKS(100));
+            }
+        }
+
+        TickType_t now = xTaskGetTickCount();
+        
+        // Dakikalık kontrol - süre azaltma
+        if ((now - lastCheck) >= pdMS_TO_TICKS(60000)) {
+            lastCheck = now;
+
+            HAL_GPIO_TogglePin(GPIOD, LD3_Pin);
+
+            for (int i = 0; i < TOTAL_SPOTS; i++) {
+                if (spots[i].status == 1 && spots[i].timeLeft > 0) {
+                    spots[i].timeLeft--;
+                    
+                    // Sürenin %80'i geçmiş ama hatırlatma gönderilmemişse
+                    uint16_t reminderThreshold = spots[i].timeLeft / 5; // Kalan sürenin 1/5'i (yani %20)
+                    if (reminderThreshold <= 2 && !reminderSent[i]) {
+                        reminderSent[i] = 1;
+                        
+                        // Reminder bilgisini gönder
+                        char reminderMsg[64];
+                        snprintf(reminderMsg, sizeof(reminderMsg), "REMINDER;%s;%d\r\n", 
+                                 spots[i].id, spots[i].timeLeft);
+                        CDC_Transmit_FS((uint8_t*)reminderMsg, strlen(reminderMsg));
+                        
+                        // OLED'e de göster
+                        OledMessage reminderOledMsg;
+                        snprintf(reminderOledMsg.line1, sizeof(reminderOledMsg.line1), "%s hatirlatma", spots[i].id);
+                        snprintf(reminderOledMsg.line2, sizeof(reminderOledMsg.line2), "Kalan: %d dk", spots[i].timeLeft);
+                        reminderOledMsg.duration_ms = 3000;
+                        xQueueSend(oledQueue, &reminderOledMsg, pdMS_TO_TICKS(100));
+                    }
+
+                    if (spots[i].timeLeft == 0) {
+                        // İstatistikleri güncelle
+                        totalMinutesParked += spots[i].timeLeft;
+                        completedReservations++;
+                        occupiedSpots--;
+                        
+                        spots[i].status = 0;
+
+                        OledMessage expiredMsg;
+                        snprintf(expiredMsg.line1, sizeof(expiredMsg.line1), "Sure bitti!");
+                        snprintf(expiredMsg.line2, sizeof(expiredMsg.line2), "%s bos", spots[i].id);
+                        expiredMsg.duration_ms = 3000;
+                        xQueueSend(oledQueue, &expiredMsg, pdMS_TO_TICKS(100));
+
+                        char usbMsg[64];
+                        snprintf(usbMsg, sizeof(usbMsg), "EXPIRED;%s\r\n", spots[i].id);
+                        CDC_Transmit_FS((uint8_t*)usbMsg, strlen(usbMsg));
+                    }
+                }
+            }
+        }
+        
+        // 30 Saniye aralıklarla istatistik güncelleme
+        if ((now - lastStatsUpdate) >= pdMS_TO_TICKS(30000)) {
+            lastStatsUpdate = now;
+            
+            // Boş park yeri sayısını say
+            uint8_t emptyCount = 0;
+            for (int i = 0; i < TOTAL_SPOTS; i++) {
+                if (spots[i].status == 0) {
+                    emptyCount++;
+                }
+            }
+            
+            // 7-segment display için
+            displayValue = emptyCount;
+            
+            // İstatistik bilgilerini OLED'e göster
+            OledMessage statsMsg;
+            snprintf(statsMsg.line1, sizeof(statsMsg.line1), "Bos: %d / Dolu: %d", 
+                     emptyCount, TOTAL_SPOTS - emptyCount);
+            snprintf(statsMsg.line2, sizeof(statsMsg.line2), "Toplam Rez: %lu", totalReservations);
+            statsMsg.duration_ms = 3000;
+            xQueueSend(oledQueue, &statsMsg, pdMS_TO_TICKS(100));
+        }
+        
+        vTaskDelay(1);
+    }
+}
+
+
+
+/* USER CODE BEGIN Header_StartDisplayTask */
+/**
+* @brief Function implementing the DisplayTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartDisplayTask */
+void StartDisplayTask(void *argument) {
+	ssd1306_Init();
+
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    const TickType_t xFrequency = pdMS_TO_TICKS(1000);
+
+    OledMessage msg;
+    uint32_t msgEndTime = 0;
+
+    while (1) {
+        // Yeni mesaj varsa al
+        if (xQueueReceive(oledQueue, &msg, 0) == pdPASS) {
+            if (xSemaphoreTake(oledMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                ssd1306_Fill(Black);
+                ssd1306_SetCursor(0, 0);
+                ssd1306_WriteString(msg.line1, Font_7x10, White);
+                ssd1306_SetCursor(0, 16);
+                ssd1306_WriteString(msg.line2, Font_7x10, White);
+                ssd1306_UpdateScreen();
+                xSemaphoreGive(oledMutex);
+                msgEndTime = HAL_GetTick() + msg.duration_ms;
+            }
+        }
+
+        // Süre dolduysa ekranı temizle
+        if (msgEndTime > 0 && HAL_GetTick() > msgEndTime) {
+            if (xSemaphoreTake(oledMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                ssd1306_Fill(Black);
+                ssd1306_UpdateScreen();
+                xSemaphoreGive(oledMutex);
+                msgEndTime = 0;
+            }
+        }
+        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    }
+}
+
+
+
+
+/**
+  * @brief  Period elapsed callback in non blocking mode
+  * @note   This function is called  when TIM10 interrupt took place, inside
+  * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
+  * a global variable "uwTick" used as application time base.
+  * @param  htim : TIM handle
+  * @retval None
+  */
+
 /**
   * @brief  This function is executed in case of error occurrence.
   * @retval None
@@ -881,4 +853,3 @@ void assert_failed(uint8_t *file, uint32_t line)
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
-

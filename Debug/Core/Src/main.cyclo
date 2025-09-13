@@ -1,0 +1,13 @@
+../Core/Src/main.c:119:6:initParkingSpots	3
+../Core/Src/main.c:136:5:main	4
+../Core/Src/main.c:241:6:SystemClock_Config	3
+../Core/Src/main.c:286:6:PeriphCommonClock_Config	2
+../Core/Src/main.c:307:13:MX_I2C1_Init	2
+../Core/Src/main.c:341:13:MX_I2S2_Init	2
+../Core/Src/main.c:375:13:MX_I2S3_Init	2
+../Core/Src/main.c:409:13:MX_SPI1_Init	2
+../Core/Src/main.c:447:13:MX_GPIO_Init	1
+../Core/Src/main.c:535:6:StartUsbCommTask	2
+../Core/Src/main.c:564:6:StartParkingManagerTask	15
+../Core/Src/main.c:672:6:StartDisplayTask	6
+../Core/Src/main.c:725:6:Error_Handler	1

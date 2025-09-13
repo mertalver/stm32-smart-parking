@@ -258,14 +258,29 @@ static int8_t CDC_Control_FS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
   * @param  Len: Number of data received (in bytes)
   * @retval Result of the operation: USBD_OK if all operations are OK else USBD_FAIL
   */
+extern char rxBuffer[64];
+extern uint8_t commandReady;
+
 static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
 {
-  /* USER CODE BEGIN 6 */
+  // Gelen veriyi rxBuffer'a kopyala (maksimum 63 byte + null karakter)
+  uint32_t length = *Len;
+  if (length >= sizeof(rxBuffer)) {
+      length = sizeof(rxBuffer) - 1;  // taşmayı engelle
+  }
+
+  memcpy(rxBuffer, Buf, length);
+  rxBuffer[length] = '\0';  // null-terminate
+
+  commandReady = 1;  // Komut geldiğini bildir
+
+  // USB buffer ayarları
   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &Buf[0]);
   USBD_CDC_ReceivePacket(&hUsbDeviceFS);
+
   return (USBD_OK);
-  /* USER CODE END 6 */
 }
+
 
 /**
   * @brief  CDC_Transmit_FS

@@ -1,0 +1,5 @@
+../Core/Src/segment_display.c:13:6:segment_init	3
+../Core/Src/segment_display.c:32:6:setSegment	2
+../Core/Src/segment_display.c:39:6:setDigit	2
+../Core/Src/segment_display.c:45:6:update7Segment	1
+../Core/Src/segment_display.c:49:6:segment_refresh_loop	2

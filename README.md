@@ -63,7 +63,6 @@ also logging events via SWV.
 ## 📂 Project Structure
 
     ├── main.c                          # FreeRTOS-based embedded firmware
-    ├── 05210000272_05210000290_...docx # Project report (detailed documentation)
 
 ------------------------------------------------------------------------
 
